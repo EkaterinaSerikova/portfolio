@@ -1,0 +1,202 @@
+#!/usr/bin/env python
+import time
+
+# pytest
+from pytest import mark
+
+# screenshot capture
+import os, shutil
+from threading import Thread
+from e2e.utilities.screenshots import capture_screenshot
+
+# random inputs
+from e2e.utilities.random_inputs import random_phone, random_fake_email
+
+# backend automation
+from e2e.src.back_end_automation import jsons, endpoints
+from e2e.src.back_end_automation.base_requests import ApiMethods
+
+# pages
+from e2e.src.front_end_automation.pages.common_elements import CommonElements
+from e2e.src.front_end_automation.pages.login_page import LoginPage
+from e2e.src.front_end_automation.pages.client_page import (PaymentsPage, InternalTransfersPage, ClientPage,
+                                                            AccountPage)
+from e2e.src.front_end_automation.pages.top_bar_page import TopBarPage
+from e2e.src.front_end_automation.pages.backoffice_page import (BackofficeSidebarButtons, DepositsPage, DashboardsPage,
+                                                                WithdrawalsPage, Notes)
+# shortcuts
+from e2e.tests.shortcuts.common_actions import CommonActions
+from e2e.tests.shortcuts.create_new_user import CreateNewUser
+
+# steps
+from e2e.tests.steps.platforms.setup_platforms import SetupPlatforms
+from e2e.tests.steps.trading_accounts.trading_accounts import TradingAccounts
+from e2e.tests.steps.trading_accounts.payments import Payments
+
+# etc
+from e2e import settings
+from time import sleep
+
+# logs
+from e2e.utilities.capture_logs import GeneralLogs
+
+@mark.mt4
+def test_create_note_withdraw(session, drv, app_config):
+    # instantiate logs
+    log = GeneralLogs("test_create_note_withdraw")
+
+    page = CommonElements(drv)
+    login_page = LoginPage(drv)
+    top_bar_page = TopBarPage(drv)
+    client_page = ClientPage(drv)
+    backoffice_page = BackofficeSidebarButtons(drv)
+    dashboards_page = DashboardsPage(drv)
+    deposits_page = DepositsPage(drv)
+    account_page = AccountPage(drv)
+    notes = Notes(drv)
+    withdrawals_page = WithdrawalsPage(drv)
+    common_actions = CommonActions(page, login_page, top_bar_page)
+    setup_platforms = SetupPlatforms(drv, app_config, session, log)
+    page = CommonElements(drv)
+    payments = Payments(session, log)
+
+    # launch thread for taking screenshots
+    stop_thread = False
+    test_name = "test_create_note_withdraw"
+    ss_path = f"screenshots/{test_name}/"
+    if os.path.exists(ss_path):
+        shutil.rmtree(ss_path)
+    os.makedirs(ss_path)
+    thread = Thread(target=capture_screenshot,
+                    kwargs={"driver": drv, "ss_path": ss_path, "stop_thread": lambda: stop_thread})
+    thread.start()
+
+    # instantiate logs
+    log = GeneralLogs(test_name)
+
+    # Setup Servers, Groups, Types
+    setup_platforms.configure_servers_groups_types_for_mt4()
+
+    # new user creds
+    user_phone_number = "+996502" + random_phone(phone_length=6)
+    user_email = random_fake_email()
+
+    # create new user
+    create_new_user = CreateNewUser(session, user_email, user_phone_number)
+    create_new_user.create_new_user()
+
+    log.add_step(f"create new user with email: {user_email}")
+    log.add_step(f"and phone: {user_phone_number}")
+
+    # update creds for user session
+    jsons.AUTH_PAYLOAD["emailOrPhone"] = user_email
+
+    # instantiate user session
+    user_session = ApiMethods(app_config.url)
+    user_session.get_authorized(jsons.AUTH_PAYLOAD)
+
+    trading_accounts = TradingAccounts(log=log, page=page, session=session, user_session=user_session,
+                                       common_actions=common_actions, client_page=client_page,
+                                       backoffice_page=backoffice_page, dashboards_page=dashboards_page,
+                                       deposits_page=deposits_page, account_page=account_page,
+                                       withdrawals_page=withdrawals_page)
+
+    # create real mt4 account
+    real_mt4_account_id, real_mt4_account_number = trading_accounts.create_real_account_with_api(account_type='4')
+    log.add_step(f"created a mt4 real account with number {real_mt4_account_number}, and id {real_mt4_account_id}")
+
+    # login as new user
+    common_actions.login_as_user(user_email)
+    log.add_step(f"login as {user_email}")
+
+    # deposit 1000 USD to account
+    first_deposit_id = trading_accounts.deposit_to_real_account(account_number=real_mt4_account_number, value="1000")
+    log.add_step(f"deposit 1000 USD to {real_mt4_account_number}, payment id: {first_deposit_id}")
+
+    # execute deposit
+    session.post(endpoints.EXECUTE_DEPOSIT % first_deposit_id)
+
+    # create payment system
+    payments.create_payment_system(title=settings.RANDOM_STRING + " payment system", deposit_commission_amount=0)
+
+    # get new payment system id
+    new_payment_system_id = payments.get_payment_system_id_by_title(title=settings.RANDOM_STRING + " payment system")
+    log.add_step(f"create payment system with id {new_payment_system_id} and title {settings.RANDOM_STRING}")
+
+    # create payment method
+    new_payment_method_id = payments.create_payment_method(
+        payment_method_title=settings.RANDOM_STRING + " payment method", payment_system_id=new_payment_system_id)
+    log.add_step(f"create payment method with id title id {new_payment_method_id} and title {settings.RANDOM_STRING}")
+
+    # make withdrawal
+    withdrawal_id = trading_accounts.make_withdrawal_with_api(account_number=real_mt4_account_number,
+                                              value="1000", payment_method_id=new_payment_method_id)
+    log.add_step(f"withdraw 1000 USD from {real_mt4_account_number}")
+
+    # get account id by account_number
+    account_id = trading_accounts.id_by_account_number(real_mt4_account_number)
+
+    # update withdrawal request body
+    jsons.MAKE_WITHDRAWAL["request"]["account"] = account_id
+    jsons.MAKE_WITHDRAWAL["request"]["amount"]["amount"] = 1000
+    jsons.MAKE_WITHDRAWAL["paymentMethod"] = new_payment_method_id
+
+    make_withdrawal_response = user_session.post(endpoints.MAKE_WITHDRAWAL, json=jsons.MAKE_WITHDRAWAL,
+                                                 no_status_check=True)
+    make_withdrawal_response_text = f"{make_withdrawal_response.json()['amount']}"
+
+    log.add_step("withdrawal response:")
+    log.add_step(make_withdrawal_response_text)
+
+    assert make_withdrawal_response_text == "You have already created withdraw requests on 1000.00 USD, available amount for new withdraw requests is 0.00 USD"
+
+    # logout as user
+    common_actions.logout()
+    log.add_step("user logged out")
+
+    # login as admin
+    common_actions.login_as_admin()
+    log.add_step("admin logged in")
+    time.sleep(3)
+
+    # switch to backoffice interface
+    try:
+        common_actions.switch_to_backoffice_interface()
+    except:
+        page.refresh()
+        common_actions.switch_to_backoffice_interface()
+
+    # click on Withdrawals
+    backoffice_page.select_withdrawals_on_sidebar.click()
+
+    # click on Withdrawal list
+    backoffice_page.select_withdrawal_list_on_sidebar.click()
+
+    # select withdrawal
+    page.find_element_by_text(user_email).click()
+
+    # click on Notes
+    notes.notes_dropdown_list.click()
+
+    # click on Note button
+    notes.add_note_button.click()
+
+    # fill in Title field
+    notes.note_title_field.input_text(settings.RANDOM_STRING)
+
+    # fill in Description field
+    notes.note_description_field.input_text(settings.RANDOM_STRING)
+
+    # click on Submit
+    notes.note_submit_button.click()
+    page.refresh()
+
+    # send request to verify that payment note was created
+    note = session.get(endpoints.WITHDRAW_NOTE % withdrawal_id)
+    assert note.json()[0]["title"] == settings.RANDOM_STRING
+    log.add_step(f"note for withdrawal with id {withdrawal_id} was created")
+
+    # destroy screenshots thread
+    stop_thread = True
+
+
